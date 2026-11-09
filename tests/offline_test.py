@@ -9,7 +9,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import ctbu_wired_login as m  # noqa: E402
+import campus_login as m  # noqa: E402
 
 FAIL = []
 
@@ -52,6 +52,15 @@ check("空内容回退默认值", m.pick_service("", "移动") == "移动")
 print("[4] URL 编码")
 check("双重编码 hello world",
       m.js_encode(m.js_encode("hello world")) == "hello%2520world")
+
+print("[5] 档案覆盖")
+m.resolve_profile({"portal": "http://10.10.10.10", "cas_base": "https://cas.example.edu.cn/lyuapServer",
+                   "campus_cidrs": ["10.10.0.0/16"], "service_keyword": "电信"})
+check("portal 覆盖生效", m.P["portal"] == "http://10.10.10.10")
+check("cas_base 覆盖生效", m.P["cas_base"].endswith("/lyuapServer"))
+check("网段覆盖生效", m.P["campus_cidrs"] == ["10.10.0.0/16"])
+check("新网段参与判断", m.ip_in_cidr("10.10.5.5", m.P["campus_cidrs"][0]))
+check("旧网段不再命中", not m.ip_in_cidr("10.102.177.74", m.P["campus_cidrs"][0]))
 
 print()
 if FAIL:

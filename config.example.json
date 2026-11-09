@@ -1,7 +1,13 @@
 {
+  "profile": "ctbu",
+
+  "portal": "",
+  "cas_base": "",
+  "campus_cidrs": [],
+
   "username": "",
   "password": "",
   "interface": "",
-  "service_keyword": "移动",
+  "service_keyword": "",
   "max_attempts": 6
 }

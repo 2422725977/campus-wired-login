@@ -1,42 +1,46 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""CTBU 有线网络连接（校园网 ePortal + 统一身份认证 CAS SSO）
+"""校园网有线认证（锐捷 ePortal + 统一身份认证 CAS/SSO）
 
-为什么需要它：
-  宿舍有线口是认证端口。插上网线后能拿到 DHCP 地址（10.102.x.x/15），
-  但未认证时所有流量都会被 AC 劫持：
-    * HTTP  -> 302/脚本跳转到 http://211.83.192.55/eportal/index.jsp?...
-    * HTTPS -> 被锐捷设备中间人（证书 subject 是 ruijie）
-  只有完成 ePortal 认证，这个口才真正放行。
+宿舍有线口通常是认证端口：插上网线能拿到 DHCP 地址，但认证前所有流量都会被
+AC 劫持 —— HTTP 被跳转到门户页面，HTTPS 被设备中间人（证书 issuer 带 ruijie）。
+只有完成 ePortal 认证，这个口才真正放行。
 
-为什么不能直接在门户页面输学号密码：
-  CTBU 的学号属于统一身份体系，ePortal 的「经典表单」通道对学生号一律回
-  「用户不允许使用本服务！」。学生必须走 SSO（CAS OAuth2）通道。
+为什么不能直接在门户页输学号密码：
+  很多学校把学号放在统一身份认证（CAS / OAuth2）里，ePortal 的经典表单通道
+  只认本地/运营商账号，学生号会被回「用户不允许使用本服务！」。
+  这种情况必须走 SSO 通道（门户 pageInfo 里 isSsoAuth=true）。
 
-为什么不能直接跑而要先绑网卡：
-  本机默认路由通常还在 Wi-Fi / 手机上。认证请求必须从有线口发出，
-  否则门户看到的是别的网段的源 IP，认证不会落在有线口上。
-  本脚本把 socket 绑定到指定网卡（不发包、不改路由、不断网）：
+为什么不能直接跑，要先绑网卡：
+  笔记本通常还连着 Wi-Fi 或热点，默认路由不在有线口上。认证请求必须从有线口
+  发出，否则门户看到的源 IP 是别的网段，认证不会落在有线口上。
+  本工具只把 socket 绑定到指定网卡，不改路由、不切默认网关，所以不会断网：
     macOS   : IP_BOUND_IF       (IPPROTO_IP, 25)
     Windows : IP_UNICAST_IF     (IPPROTO_IP, 31)
     Linux   : SO_BINDTODEVICE   (SOL_SOCKET, 25)
 
+适配其他学校：
+  内置 profile 只有一所学校（ctbu）。别的学校只需要三样东西：
+    1. 未认证时被跳转到的门户地址   -> --portal 或 config.json 的 "portal"
+    2. 统一身份认证地址（CAS 根）    -> --cas
+    3. 有线口拿到的网段             -> --cidr（可重复）
+  或者写一个 profiles/你的学校.json，用 --profile 你的学校 加载。
+
 用法：
-  python3 ctbu_wired_login.py                 # 自动找有线网卡并登录
-  python3 ctbu_wired_login.py --check         # 只检查状态，不登录
-  python3 ctbu_wired_login.py --iface en0     # 指定网卡（Windows 可写别名或序号）
-  python3 ctbu_wired_login.py -u 学号 -p 密码   # 账号也可以命令行给，或写进 config.json
+  python3 campus_login.py                     # 用默认 profile 登录
+  python3 campus_login.py --check             # 只检查状态
+  python3 campus_login.py --portal http://1.2.3.4 --cas https://cas.x.edu.cn/lyuapServer --cidr 10.0.0.0/8
+  python3 campus_login.py --iface en0 -u 学号 -p 密码
+  python3 campus_login.py --profile ctbu
 
 零第三方依赖，只用标准库。
 """
-
 import argparse
 import getpass
 from http.cookiejar import CookieJar
 import json
 import os
 import platform
-import random
 import re
 import socket
 import ssl
@@ -49,13 +53,51 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
               "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 
-PORTAL = "http://211.83.192.55"
-CAS_BASE = "https://cas.ctbu.edu.cn/lyuapServer"
-CAMPUS_CIDRS = ["10.102.0.0/15", "10.203.0.0/17", "211.83.0.0/16"]
+# 内置档案。加一所学校 = 往这里加一条，或写 profiles/<名字>.json。
+# portal / cas_base / campus_cidrs 是必须改的三项，其余给的是锐捷的通用默认值。
+DEFAULT_PROFILE = "ctbu"
+PROFILES = {
+    "ctbu": {
+        "_name": "重庆工商大学（随仓库附带的示例）",
+        "portal": "http://211.83.192.55",
+        "cas_base": "https://cas.ctbu.edu.cn/lyuapServer",
+        "campus_cidrs": ["10.102.0.0/15", "10.203.0.0/17", "211.83.0.0/16"],
+        "service_keyword": "移动",
+        "password_reverse": True,
+        "captcha_path": "/kaptcha",
+        "pubkey_path": "/v2/getPubKey",
+        "login_path": "/login",
+    },
+}
+
+P = dict(PROFILES[DEFAULT_PROFILE])
+
+
+def resolve_profile(cfg):
+    """把 config / 命令行里的覆盖项合并进全局档案 P。"""
+    name = (cfg or {}).get("profile") or DEFAULT_PROFILE
+    prof = PROFILES.get(name)
+    if prof is None:
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "profiles", name + ".json")
+        if os.path.exists(path):
+            try:
+                with open(path, "r", encoding="utf-8") as fh:
+                    prof = json.load(fh)
+            except Exception as e:
+                log("档案文件读取失败：%s" % e, "WARN")
+    if prof:
+        P.update(prof)
+    for key in ("portal", "cas_base", "service_keyword", "password_reverse"):
+        if (cfg or {}).get(key):
+            P[key] = cfg[key]
+    if (cfg or {}).get("campus_cidrs"):
+        P["campus_cidrs"] = cfg["campus_cidrs"]
+    return P
 
 IS_WIN = platform.system() == "Windows"
 IS_MAC = platform.system() == "Darwin"
@@ -174,7 +216,7 @@ def pick_interface(prefer=None):
     def score(item):
         name, ip, desc = item
         s = 0
-        if any(ip_in_cidr(ip, c) for c in CAMPUS_CIDRS):
+        if any(ip_in_cidr(ip, c) for c in P["campus_cidrs"]):
             s += 10
         blob = ("%s %s" % (name, desc)).lower()
         if any(w in blob for w in WIFI_WORDS):
@@ -326,7 +368,7 @@ def capture_querystring(timeout=15):
 
 
 def online_info(timeout=15, jar=None):
-    code, h, body, f = http(PORTAL + "/eportal/InterFace.do?method=getOnlineUserInfo",
+    code, h, body, f = http(P["portal"] + "/eportal/InterFace.do?method=getOnlineUserInfo",
                             timeout=timeout, jar=jar)
     try:
         d = json.loads(decode(body))
@@ -336,11 +378,11 @@ def online_info(timeout=15, jar=None):
 
 
 def get_services(querystring, timeout=15, jar=None):
-    url = (PORTAL + "/eportal/InterFace.do?method=getServices"
+    url = (P["portal"] + "/eportal/InterFace.do?method=getServices"
            + "&queryString=" + (querystring or ""))
     code, h, body, f = http(url, data=b"", timeout=timeout, jar=jar,
                             headers={"Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-                                     "Referer": PORTAL + "/eportal/index.jsp"})
+                                     "Referer": P["portal"] + "/eportal/index.jsp"})
     return decode(body)
 
 
@@ -416,6 +458,7 @@ def show_captcha(img_bytes):
 # 登录主流程
 # --------------------------------------------------------------------------
 def do_login(cfg, check_only=False):
+    resolve_profile(cfg)
     iface, ip, desc = pick_interface(cfg.get("interface") or None)
     if not iface:
         log("没找到可用的网卡，请检查网线是否插好、是否已获取 DHCP 地址。", "ERR")
@@ -423,9 +466,9 @@ def do_login(cfg, check_only=False):
     log("使用网卡：%s  IP=%s  %s" % (iface, ip or "?", desc or ""))
 
     explicit = bool(cfg.get("interface"))
-    campus = bool(ip) and any(ip_in_cidr(ip, c) for c in CAMPUS_CIDRS)
+    campus = bool(ip) and any(ip_in_cidr(ip, c) for c in P["campus_cidrs"])
     if not campus:
-        log("这块网卡的地址 %s 不在校园网段（%s）。" % (ip or "无", "、".join(CAMPUS_CIDRS)), "ERR")
+        log("这块网卡的地址 %s 不在校园网段（%s）。" % (ip or "无", "、".join(P["campus_cidrs"])), "ERR")
         if not explicit:
             log("有线口还没拿到 10.x 地址：网线没插好 / 链路没起来 / DHCP 没成功。", "ERR")
             log("本工具只认证有线口，不会把 Wi-Fi 或手机热点当成有线去登录。", "ERR")
@@ -454,7 +497,7 @@ def do_login(cfg, check_only=False):
     log("queryString 长度 %d" % len(qs))
 
     page = get_services(qs, jar=jar)
-    svc = pick_service(page, cfg.get("service_keyword") or "移动")
+    svc = pick_service(page, cfg.get("service_keyword") or P.get("service_keyword") or "移动")
     log("出口 service = %s" % svc)
 
     if check_only:
@@ -489,12 +532,12 @@ def do_login(cfg, check_only=False):
 
 def sso_once(qs, svc, user, pwd, jar):
     # 1. 门户 SSO 入口 -> CAS 登录页
-    entry = "%s/eportal/login_sso.jsp?%s&serviceName=%s" % (PORTAL, qs, js_encode(js_encode(svc)))
+    entry = "%s/eportal/login_sso.jsp?%s&serviceName=%s" % (P["portal"], qs, js_encode(js_encode(svc)))
     code, h, body, final = http(entry, timeout=30, jar=jar)
     html = decode(body)
     m = re.search(r'name="execution"\s+value="([^"]+)"', html)
     if not m:
-        code, h, body, final = http(CAS_BASE + "/login", timeout=30, jar=jar)
+        code, h, body, final = http(P["cas_base"] + P["login_path"], timeout=30, jar=jar)
         html = decode(body)
         m = re.search(r'name="execution"\s+value="([^"]+)"', html)
     if not m:
@@ -502,9 +545,9 @@ def sso_once(qs, svc, user, pwd, jar):
     execution = m.group(1)
 
     # 2. 验证码
-    ccode, ch, cbody, cf = http("%s/kaptcha?time=%d" % (CAS_BASE, int(time.time() * 1000)),
+    ccode, ch, cbody, cf = http("%s%s?time=%d" % (P["cas_base"], P["captcha_path"], int(time.time() * 1000)),
                                 timeout=30, jar=jar,
-                                headers={"Referer": CAS_BASE + "/login", "Accept": "image/*"})
+                                headers={"Referer": P["cas_base"] + P["login_path"], "Accept": "image/*"})
     if ccode != 200 or not cbody:
         return False, "验证码下载失败（code=%s）" % ccode
     captcha = show_captcha(cbody)
@@ -512,19 +555,20 @@ def sso_once(qs, svc, user, pwd, jar):
         return False, "没有输入验证码"
 
     # 3. 公钥
-    kcode, kh, kbody, kf = http(CAS_BASE + "/v2/getPubKey", timeout=30, jar=jar)
+    kcode, kh, kbody, kf = http(P["cas_base"] + P["pubkey_path"], timeout=30, jar=jar)
     try:
         pk = json.loads(decode(kbody))
         modulus, exponent = pk["modulus"], pk["exponent"]
     except Exception:
         return False, "拿不到 RSA 公钥（code=%s）" % kcode
 
-    enc_pwd = rsa_encrypt(pwd[::-1], modulus, exponent)
+    enc_pwd = rsa_encrypt(pwd[::-1] if P.get("password_reverse", True) else pwd,
+                          modulus, exponent)
     data = {"username": user, "password": enc_pwd, "authcode": captcha,
             "execution": execution, "_eventId": "submit", "rememberMe": "true"}
-    pcode, ph, pbody, ptext = http(CAS_BASE + "/login", data=data, timeout=30, jar=jar,
-                                   headers={"Referer": CAS_BASE + "/login",
-                                            "Origin": "https://cas.ctbu.edu.cn",
+    pcode, ph, pbody, ptext = http(P["cas_base"] + P["login_path"], data=data, timeout=30, jar=jar,
+                                   headers={"Referer": P["cas_base"] + P["login_path"],
+                                            "Origin": P["cas_base"].split("/lyuapServer")[0],
                                             "Content-Type": "application/x-www-form-urlencoded"})
     page = decode(pbody)
 
@@ -581,12 +625,23 @@ def load_config(path):
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(description="CTBU 校园网有线认证（ePortal + CAS SSO）")
+    ap = argparse.ArgumentParser(
+        description="校园网有线认证：锐捷 ePortal + 统一身份认证（CAS SSO）")
     ap.add_argument("--iface", default=None, help="指定网卡（默认自动找有线口）")
     ap.add_argument("--check", action="store_true", help="只检查状态，不登录")
     ap.add_argument("-u", "--username", default=None)
     ap.add_argument("-p", "--password", default=None)
     ap.add_argument("-c", "--config", default="config.json")
+    ap.add_argument("--profile", default=None,
+                    help="使用哪套配置档案：内置名（ctbu）或 profiles/<名字>.json")
+    ap.add_argument("--portal", default=None,
+                    help="门户地址，如 http://10.10.10.10（未认证时被跳转到的那个）")
+    ap.add_argument("--cas", default=None,
+                    help="统一身份认证地址，如 https://cas.example.edu.cn/lyuapServer")
+    ap.add_argument("--cidr", action="append", default=None,
+                    help="校园网段，可重复，如 --cidr 10.102.0.0/15")
+    ap.add_argument("--service", default=None,
+                    help="运营商出口关键字：移动 / 电信 / 联通 / 校园网 / default")
     ap.add_argument("--version", action="version", version=VERSION)
     args = ap.parse_args(argv)
 
@@ -603,6 +658,18 @@ def main(argv=None):
         cfg["username"] = args.username
     if args.password:
         cfg["password"] = args.password
+    if args.profile:
+        cfg["profile"] = args.profile
+    if args.portal:
+        cfg["portal"] = args.portal
+    if args.cas:
+        cfg["cas_base"] = args.cas
+    if args.cidr:
+        cfg["campus_cidrs"] = args.cidr
+    if args.service:
+        cfg["service_keyword"] = args.service
+
+    resolve_profile(cfg)
 
     try:
         return do_login(cfg, check_only=args.check)

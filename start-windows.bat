@@ -11,6 +11,6 @@ if errorlevel 1 (
   exit /b 1
 )
 
-python -X utf8 ctbu_wired_login.py %*
+python -X utf8 campus_login.py %*
 echo.
 pause

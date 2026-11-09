@@ -1,0 +1,14 @@
+{
+  "_name": "某学校的配置示例（复制这个文件，改成你的学校，然后 --profile 文件名，不带 .json）",
+
+  "portal": "http://10.10.10.10",
+  "cas_base": "https://cas.example.edu.cn/lyuapServer",
+  "campus_cidrs": ["10.10.0.0/16"],
+
+  "service_keyword": "移动",
+  "password_reverse": true,
+
+  "captcha_path": "/kaptcha",
+  "pubkey_path": "/v2/getPubKey",
+  "login_path": "/login"
+}
