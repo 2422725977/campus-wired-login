@@ -422,6 +422,17 @@ def do_login(cfg, check_only=False):
         return 2
     log("使用网卡：%s  IP=%s  %s" % (iface, ip or "?", desc or ""))
 
+    explicit = bool(cfg.get("interface"))
+    campus = bool(ip) and any(ip_in_cidr(ip, c) for c in CAMPUS_CIDRS)
+    if not campus:
+        log("这块网卡的地址 %s 不在校园网段（%s）。" % (ip or "无", "、".join(CAMPUS_CIDRS)), "ERR")
+        if not explicit:
+            log("有线口还没拿到 10.x 地址：网线没插好 / 链路没起来 / DHCP 没成功。", "ERR")
+            log("本工具只认证有线口，不会把 Wi-Fi 或手机热点当成有线去登录。", "ERR")
+            log("把网线插回有线口，等 ifconfig 里出现 10.x 地址后再跑。", "ERR")
+            return 3
+        log("你手动指定的网卡不在校园网段，继续尝试，但登录大概率会失败。", "WARN")
+
     jar = CookieJar()
     conn_factory = make_socket(iface, ip)
     socket.create_connection = conn_factory
