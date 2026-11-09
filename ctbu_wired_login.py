@@ -95,10 +95,12 @@ def list_interfaces():
     """返回 [(name, ip, desc)]，只含 IPv4。"""
     out = []
     if IS_WIN:
-        ps = ("powershell -NoProfile -Command "
-              "\"Get-NetIPAddress -AddressFamily IPv4 | "
-              "Select-Object InterfaceIndex,InterfaceAlias,IPAddress | ConvertTo-Json\"")
-        raw = _run(ps)
+        script = ("Get-NetIPAddress -AddressFamily IPv4 | "
+                  "Select-Object InterfaceIndex,InterfaceAlias,IPAddress | ConvertTo-Json")
+        raw = _run(["powershell", "-NoProfile", "-NonInteractive", "-Command", script])
+        if not raw.strip():
+            raw = _run(["powershell", "-NoProfile", "-NonInteractive",
+                        "-ExecutionPolicy", "Bypass", "-Command", script])
         try:
             data = json.loads(raw)
             if isinstance(data, dict):
@@ -221,8 +223,14 @@ def make_socket(iface, local_ip):
                 if IS_MAC and idx:
                     s.setsockopt(socket.IPPROTO_IP, 25, idx)          # IP_BOUND_IF
                 elif IS_WIN and idx:
-                    s.setsockopt(socket.IPPROTO_IP, 31,
-                                 struct.pack("I", idx))                # IP_UNICAST_IF
+                    # IP_UNICAST_IF：文档要求网络字节序，但部分版本接受主机序，
+                    # 两种都试，谁的接口索引合法就用谁。
+                    for fmt in ("!I", "I"):
+                        try:
+                            s.setsockopt(socket.IPPROTO_IP, 31, struct.pack(fmt, idx))
+                            break
+                        except OSError:
+                            continue
                 elif IS_LINUX:
                     s.setsockopt(socket.SOL_SOCKET, 25,
                                  (iface + "\0").encode())              # SO_BINDTODEVICE
